@@ -9,6 +9,8 @@ The example image of that lesson is included so you can simply run
 
     ./line_finder.py exit-ramp.jpg
 
+You can also specify more input images and cycle through them with `n`.
+
 ## Demo
 
 ![Alt Text](https://thumbs.gfycat.com/CandidRemarkableAstarte-size_restricted.gif)
