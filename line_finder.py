@@ -4,9 +4,11 @@
 
 import numpy as np
 import cv2
+from moviepy.editor import VideoFileClip
+import time
 
 TOL = 1e-6
-N_FLAGS = 3 # number of flags that control image generation, see make_img
+N_FLAGS = 4 # number of flags that control image generation, see make_img
 
 
 def apply_mask(img, vertices):
@@ -28,57 +30,78 @@ def draw_lines(img, lines, color = (255, 0, 0), thickness = 2):
                 cv2.line(img, (x1, y1), (x2, y2), color, thickness)
 
 
+def angle(a, b):
+    """Return angle between two vectors."""
+    return np.arccos(np.dot(a, b) / np.linalg.norm(a) / np.linalg.norm(b)) * 180 / np.pi
+
+
+def filter_lines(lines, angle_tolerance = 20):
+    """Filter lines for lane detection.
+
+    Only consider lines of a certain angle and split between lines
+    indicating left and right lanes.
+    """
+    left_lines = []
+    right_lines = []
+
+    for line in lines:
+        left_lane_lines = []
+        right_lane_lines = []
+        for px, py, qx, qy in line:
+            p = np.array([px, py])
+            q = np.array([qx, qy])
+            s = q - p
+
+            # normalize to have an upwards pointing line segment
+            if s[1] < 0:
+                s *= -1
+
+            left_lane_prior = np.array([1.0, 1.0])
+            right_lane_prior = np.array([-1.0, 1.0])
+            if angle(s, left_lane_prior) < angle_tolerance:
+                left_lane_lines.append((p[0], p[1], q[0], q[1]))
+            if angle(s, right_lane_prior) < angle_tolerance:
+                right_lane_lines.append((p[0], p[1], q[0], q[1]))
+        if left_lane_lines:
+            left_lines.append(left_lane_lines)
+        if right_lane_lines:
+            right_lines.append(right_lane_lines)
+
+    return left_lines, right_lines
+
+
 def lines_to_lanes(lines, y_bottom, y_middle):
     """Infer lanes from the given lines.
     
-    Filter out horizontal line segments, extrapolate line segment such that
-    it goes from y_bottom to y_middle on the y component, seperate line
-    segments for left lane from those for right lane and finally take the
-    median of the x components of the points defining the line.
+    Extrapolate line segments such that they go from y_bottom to y_middle on
+    the y component and then take the median of the x components of the
+    points defining the line.
     """
-    left_lane_bottoms = []
-    left_lane_middles = []
-    right_lane_bottoms = []
-    right_lane_middles = []
+    lane_bottoms = []
+    lane_middles = []
 
     for line in lines:
-        px, py, qx, qy = line[0]
-        length = np.sqrt((qx - px)**2 + (qy - py)**2)
-        # only accept lines that are neither vertical nor horizontal
-        if((np.abs(qx - px) / length > TOL) and
-                (np.abs(qy - py) / length > TOL)):
+        for px, py, qx, qy in line:
             lambda_middle = (y_middle - py) / (qy - py)
             lambda_bottom = (y_bottom - py) / (qy - py)
 
             x_middle = np.round(px + lambda_middle * (qx - px)).astype(int)
             x_bottom = np.round(px + lambda_bottom * (qx - px)).astype(int)
 
-            # decide which lane this line corresponds to by looking at the
-            # quadrant in which the line is
-            if (qx > px and qy > py) or (qx < px and qy < py):
-                # first or third quadrant is left lane
-                left_lane_bottoms.append(x_bottom)
-                left_lane_middles.append(x_middle)
-            else:
-                # second and fourth quadrant is right lane
-                right_lane_bottoms.append(x_bottom)
-                right_lane_middles.append(x_middle)
+            lane_bottoms.append(x_bottom)
+            lane_middles.append(x_middle)
 
     # take the medians for final decision and return a result that is
     # compatible with the structure returned by HoughLinesP, i.e. a sequence
     # of lines each being a sequence of x1,y1,x2,y2 where (x1,y1) and
     # (x2, y2) determine the line.
-    lanes = []
-    if left_lane_bottoms:
-        x_bottom_left = np.round(np.median(left_lane_bottoms)).astype(int)
-        x_middle_left = np.round(np.median(left_lane_middles)).astype(int)
-        lanes.append([(x_bottom_left, y_bottom, x_middle_left, y_middle)])
-    if right_lane_bottoms:
-        x_bottom_right = np.round(np.median(right_lane_bottoms)).astype(int)
-        x_middle_right = np.round(np.median(right_lane_middles)).astype(int)
-        lanes.append([(x_bottom_right, y_bottom, x_middle_right, y_middle)])
+    lane = []
+    if lane_bottoms and lane_middles:
+        x_bottom = np.round(np.median(lane_bottoms)).astype(int)
+        x_middle = np.round(np.median(lane_middles)).astype(int)
+        lane.append([(x_bottom, y_bottom, x_middle, y_middle)])
 
-    return lanes
+    return lane
 
 
 def detect_lle(
@@ -87,8 +110,10 @@ def detect_lle(
         canny_low_threshold, canny_high_threshold,
         hough_rho, hough_theta, hough_threshold,
         hough_min_line_length, hough_max_line_gap,
-        vertical_lane_offset = 50,
-        mask_vertices = None, **kwargs):
+        angle_tolerance,
+        vertical_lane_offset = 60,
+        mask_vertices = None,
+        **kwargs):
     """Find lanes, lines and edges of img."""
     # make sure gaussian kernel size is odd
     if gauss_kernel_size % 2 == 0:
@@ -110,11 +135,15 @@ def detect_lle(
             hough_min_line_length, hough_max_line_gap)
     # replace with empty iterable if no lines were found
     lines = lines if lines is not None else []
+
+    # filter the lines found
+    left_lines, right_lines = filter_lines(lines, angle_tolerance)
     
     # infer lanes from line segments
-    lanes = lines_to_lanes(lines, img.shape[0], img.shape[0] // 2 + vertical_lane_offset)
+    left_lane = lines_to_lanes(left_lines, img.shape[0], img.shape[0] // 2 + vertical_lane_offset)
+    right_lane = lines_to_lanes(right_lines, img.shape[0], img.shape[0] // 2 + vertical_lane_offset)
 
-    return lanes, lines, edges
+    return left_lane, right_lane, left_lines, right_lines, lines, edges
 
 
 def make_img(img, mode, **kwargs):
@@ -125,12 +154,14 @@ def make_img(img, mode, **kwargs):
     0-th bit: If set, use original image as background otherwise use edges
     1-th bit: If set draw lines detected in the image
     2-th bit: If set draw lanes detected in the image
+    3-th bit: If set draw filtered lines
     """
-    lanes, lines, edges = detect_lle(img = img, **kwargs)
+    left_lane, right_lane, left_lines, right_lines, lines, edges = detect_lle(img = img, **kwargs)
 
     background_bit = 0
     lines_bit = 1
     lanes_bit = 2
+    filtered_bit = 3
 
     # use either the original image or the edges of the image as canvas
     if mode & 1<<background_bit:
@@ -145,7 +176,12 @@ def make_img(img, mode, **kwargs):
         draw_lines(bg, lines, color = (255,0,0), thickness = 2)
 
     if mode & 1<<lanes_bit:
-        draw_lines(bg, lanes, color = (0,0,255), thickness = 6)
+        draw_lines(bg, left_lane, color = (0,0,255), thickness = 6)
+        draw_lines(bg, right_lane, color = (0,0,255), thickness = 6)
+
+    if mode & 1<<filtered_bit:
+        draw_lines(bg, left_lines, color = (255,0,255), thickness = 6)
+        draw_lines(bg, right_lines, color = (0,255,255), thickness = 6)
 
     # combine base with lines
     return cv2.addWeighted(base, 0.8, bg, 1.0, 0.0)
@@ -181,31 +217,41 @@ if __name__ == "__main__":
         exit(1)
 
     fnames = sys.argv[1:]
+    video_fnames = [fname for fname in fnames if fname.endswith(".mp4")]
+    img_fnames = [fname for fname in fnames if fname.endswith(".jpg")]
 
     # read images
     images = []
-    for fname in fnames:
+    for fname in img_fnames:
         images.append(cv2.imread(fname))
-    print("Read {} images.".format(len(images)))
+    videos = []
+    for fname in video_fnames:
+        videos.append(VideoFileClip(fname))
+
+    print("Read {} images and {} videos.".format(len(images), len(videos)))
 
     # Line finder
-    image_cycle = itertools.cycle(images)
-    image = next(image_cycle)
-    vertices = make_mask(image)
+    input_cycle = itertools.cycle(images + videos)
+    current_input = next(input_cycle)
+    current_frame = 0
+    #vertices = make_mask(image)
     state = {
-            "img": image,
+            "img": None,
             "result": None,
-            "gauss_kernel_size": 3,
+            "gauss_kernel_size": 1,
             "canny_low_threshold": 50,
-            "canny_high_threshold": 150,
+            "canny_high_threshold": 100,
             "hough_rho": 1,
             "hough_theta": 1,
-            "hough_threshold": 40,
-            "hough_min_line_length": 5,
+            "hough_threshold": 30,
+            "hough_min_line_length": 10,
             "hough_max_line_gap": 5,
-            "mask_vertices": vertices,
-            "mode": int("101", 2)}
-    vertices = make_mask(image)
+            "angle_tolerance": 20,
+            "mask_vertices": None,
+            "mask_horizontal_aperture": 80,
+            "mask_vertical_adjustment": 80,
+            "mode": int("0101", 2),
+            "stop": False}
 
     # parameters exposed to ui together with maximum values
     ui_max_params = {
@@ -215,6 +261,8 @@ if __name__ == "__main__":
             "hough_threshold": 500,
             "hough_min_line_length": 500,
             "hough_max_line_gap": 500,
+            "mask_horizontal_aperture": 500,
+            "mask_vertical_adjustment": 500,
             "mode": (1 << N_FLAGS) - 1}
 
     # Create window to show result and controls
@@ -234,6 +282,33 @@ if __name__ == "__main__":
 
     # Main loop
     while True:
+        if type(current_input) != np.ndarray:
+            if current_frame == 0:
+                fps = current_input.fps
+                current_input = itertools.cycle(current_input.iter_frames(dtype = "uint8"))
+            if not state["stop"]:
+                frame = next(current_input).copy()
+                frame[:,:,:] = frame[:,:,[2,1,0]]
+                time.sleep(1.0/fps)
+                update(frame, "img", state)
+                update(make_mask(
+                    frame,
+                    mask_horizontal_aperture = state["mask_horizontal_aperture"],
+                    mask_vertical_adjustment = state["mask_vertical_adjustment"]),
+                    "mask_vertices", state)
+                current_frame += 1
+        else:
+            if current_frame == 0:
+                update(current_input, "img", state)
+                update(make_mask(current_input), "mask_vertices", state)
+                update(make_mask(
+                    current_input,
+                    mask_horizontal_aperture = state["mask_horizontal_aperture"],
+                    mask_vertical_adjustment = state["mask_vertical_adjustment"]),
+                    "mask_vertices", state)
+                current_frame += 1
+
+
         if state["result"] is None:
             state["result"] = make_img(**state)
 
@@ -244,7 +319,9 @@ if __name__ == "__main__":
             # quit
             break
         elif key == ord('n'):
-            # next image
-            image = next(image_cycle)
-            update(image, "img", state)
-            update(make_mask(image), "mask_vertices", state)
+            # next input
+            current_input = next(input_cycle)
+            current_frame = 0
+        elif key == ord('s'):
+            # toggle stop for videos
+            state["stop"] = not state["stop"]
